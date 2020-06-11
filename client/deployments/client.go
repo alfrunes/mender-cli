@@ -14,6 +14,7 @@
 package deployments
 
 import (
+	"bytes"
 	"crypto/tls"
 	"fmt"
 	"io"
@@ -58,77 +59,75 @@ func NewClient(url string, skipVerify bool) *Client {
 
 func (c *Client) UploadArtifact(description, artifactPath, tokenPath string, noProgress bool) error {
 
-	var bar *pb.ProgressBar
+	var (
+		bar  *pb.ProgressBar
+		buf  *bytes.Buffer
+		body io.Reader = buf
+	)
 
 	artifact, err := os.Open(artifactPath)
 	if err != nil {
 		return errors.Wrap(err, "Cannot read artifact file")
 	}
+	defer artifact.Close()
 
 	artifactStats, err := artifact.Stat()
 	if err != nil {
 		return errors.Wrap(err, "Cannot read artifact file stats")
 	}
-
-	// create pipe
-	pR, pW := io.Pipe()
+	buf = bytes.NewBuffer(make([]byte, artifactStats.Size()))
 
 	// create multipart writer
-	writer := multipart.NewWriter(pW)
+	writer := multipart.NewWriter(buf)
 
 	token, err := ioutil.ReadFile(tokenPath)
 	if err != nil {
 		return errors.Wrap(err, "Please Login first")
 	}
+	if !noProgress {
+		// create progress bar
+		bar = pb.New64(artifactStats.Size()).Set(pb.Bytes, true).SetRefreshRate(time.Millisecond * 100)
+		log.Info("Buffering request")
+		bar.Start()
+	}
 
-	req, err := http.NewRequest(http.MethodPost, c.artifactUploadUrl, pR)
+	writer.WriteField("size", strconv.FormatInt(artifactStats.Size(), 10))
+	writer.WriteField("description", description)
+	part, _ := writer.CreateFormFile("artifact", artifactStats.Name())
+
+	if !noProgress {
+		part = bar.NewProxyWriter(part)
+	}
+
+	if _, err := io.Copy(part, artifact); err != nil {
+		writer.Close()
+		return errors.Wrap(err, "error preparing multipart request")
+	}
+	writer.Close()
+
+	if !noProgress {
+		bar.Finish()
+		log.Info("Uploading artifact to: %s" + c.artifactUploadUrl)
+		bar = pb.New(buf.Len()).Set(pb.Bytes, true).SetRefreshRate(time.Millisecond * 100)
+		body = bar.NewProxyReader(buf)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, c.artifactUploadUrl, body)
 	if err != nil {
 		return errors.Wrap(err, "Cannot create request")
 	}
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 	req.Header.Set("Authorization", "Bearer "+string(token))
+	req.ContentLength = int64(buf.Len())
 
 	reqDump, _ := httputil.DumpRequest(req, false)
 	log.Verbf("sending request: \n%v", string(reqDump))
-
-	if !noProgress {
-		// create progress bar
-		bar = pb.New64(artifactStats.Size()).Set(pb.Bytes, true).SetRefreshRate(time.Millisecond * 100)
-		bar.Start()
-	}
-
-	go func() {
-		var part io.Writer
-		defer pW.Close()
-		defer artifact.Close()
-
-		writer.WriteField("size", strconv.FormatInt(artifactStats.Size(), 10))
-		writer.WriteField("description", description)
-		part, _ = writer.CreateFormFile("artifact", artifactStats.Name())
-
-		if !noProgress {
-			part = bar.NewProxyWriter(part)
-		}
-
-		if _, err := io.Copy(part, artifact); err != nil {
-			writer.Close()
-			pR.CloseWithError(err)
-			return
-		}
-
-		writer.Close()
-		if !noProgress {
-			log.Info("Processing uploaded file. This may take around one minute.\n")
-		}
-		return
-	}()
 
 	rsp, err := c.client.Do(req)
 	if err != nil {
 		return errors.Wrap(err, "POST /artifacts request failed")
 	}
 	defer rsp.Body.Close()
-	pR.Close()
 
 	rspDump, _ := httputil.DumpResponse(rsp, true)
 	log.Verbf("response: \n%v\n", string(rspDump))
