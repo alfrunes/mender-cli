@@ -21,7 +21,6 @@ import (
 	"net"
 	"os"
 	"strconv"
-	"sync"
 
 	"github.com/google/uuid"
 	"github.com/mendersoftware/go-lib-micro/ws"
@@ -33,11 +32,10 @@ import (
 const portForwardUDPChannelSize = 20
 
 type UDPPortForwarder struct {
-	conn          *net.UDPConn
-	remoteHost    string
-	remotePort    uint16
-	sourceAddr    *net.UDPAddr
-	waitGroupAcks *sync.WaitGroup
+	conn       *net.UDPConn
+	remoteHost string
+	remotePort uint16
+	sourceAddr *net.UDPAddr
 }
 
 func NewUDPPortForwarder(
@@ -62,10 +60,9 @@ func NewUDPPortForwarder(
 		return nil, err
 	}
 	return &UDPPortForwarder{
-		conn:          conn,
-		remoteHost:    remoteHost,
-		remotePort:    remotePort,
-		waitGroupAcks: &sync.WaitGroup{},
+		conn:       conn,
+		remoteHost: remoteHost,
+		remotePort: remotePort,
 	}, nil
 }
 
@@ -158,9 +155,6 @@ func (p *UDPPortForwarder) Run(
 						}
 						msgChan <- m
 					}
-				} else if m.Header.Proto == ws.ProtoTypePortForward &&
-					m.Header.MsgType == wspf.MessageTypePortForwardAck {
-					p.waitGroupAcks.Add(-1)
 				}
 			case <-ctx.Done():
 				return
@@ -177,11 +171,6 @@ func (p *UDPPortForwarder) Run(
 			}
 			return
 		case data := <-dataChan:
-			// wait to receive all the previous acks
-			p.waitGroupAcks.Wait()
-
-			// add an expected ack to the wait group
-			p.waitGroupAcks.Add(1)
 
 			m := &ws.ProtoMsg{
 				Header: ws.ProtoHdr{
